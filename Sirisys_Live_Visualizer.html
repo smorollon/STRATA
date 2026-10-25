@@ -1475,52 +1475,67 @@ function applySnapshot(snap) {
   if (snap.question)  appendLog(snap.cycle, 'Sombunal ?  ' + snap.question, 'sombunal');
 }
 
-let ws = null;
-let reconnectTimer = null;
+// ─── HTTP polling transport (WebSocket handshake blocked by ASGI 403) ───
+let pollingTimer  = null;
+let pollInterval  = 300;   // ms between polls while running
+let lastPollCycle = -1;
+let serverStatus  = null;
 
 function setConnStatus(state) {
   const dot = document.getElementById('conn-dot');
   const txt = document.getElementById('conn-text');
   dot.className = 'dot ' + state;
   txt.textContent = ({
-    online:     'connected',
+    online:     'connected (polling)',
     offline:    'disconnected - retrying',
     connecting: 'connecting...',
   })[state] || state;
 }
 
-function connect() {
-  setConnStatus('connecting');
-  const proto = location.protocol === 'https:' ? 'wss:' : 'ws:';
-  ws = new WebSocket(proto + '//' + location.host + '/ws');
+async function fetchJSON(path, opts) {
+  const r = await fetch(path, opts);
+  return r.json();
+}
 
-  ws.onopen = () => {
-    setConnStatus('online');
-    if (reconnectTimer) { clearTimeout(reconnectTimer); reconnectTimer = null; }
-  };
-  ws.onmessage = ev => {
-    let msg;
-    try { msg = JSON.parse(ev.data); }
-    catch (err) { console.error('Bad WS message:', err, ev.data); return; }
-    try {
-      if (msg.type === 'cycle')      applySnapshot(msg);
-      else if (msg.type === 'status') updateStatus(msg);
-      else if (msg.type === 'ack')    updateStatus(msg.status);
-    } catch (err) {
-      console.error('Snapshot handler crashed:', err, msg);
+async function pollStatus() {
+  try {
+    const st = await fetchJSON('/api/status');
+    serverStatus = st;
+    updateStatus(st);
+
+    // If running, fetch the latest snapshot via streaming ledger endpoint
+    if (st.running) {
+      setConnStatus('online');
+      try {
+        // Fetch latest cycle data — the server streams full snapshots
+        const snap = await fetchJSON('/api/snapshot');
+        if (snap.cycle !== lastPollCycle) {
+          lastPollCycle = snap.cycle;
+          applySnapshot(snap);
+        }
+      } catch(e) {
+        // Fallback: no snapshot endpoint, just poll status
+      }
+    } else {
+      setConnStatus('online');
     }
-  };
-  ws.onclose = () => {
+  } catch (err) {
     setConnStatus('offline');
-    reconnectTimer = setTimeout(connect, 2000);
-  };
-  ws.onerror = () => { };
+  }
+
+  const delay = serverStatus && serverStatus.running
+    ? pollInterval
+    : Math.min(pollInterval * 3, 2000);
+  pollingTimer = setTimeout(pollStatus, delay);
 }
 
 function sendAction(action, extra) {
-  if (ws && ws.readyState === WebSocket.OPEN) {
-    ws.send(JSON.stringify(Object.assign({ action }, extra || {})));
-  }
+  const body = Object.assign({ action }, extra || {});
+  fetch(`/api/control/${action}`, {
+    method: 'POST',
+    headers: {'Content-Type': 'application/json'},
+    body: JSON.stringify(body)
+  }).catch(e => console.error('Control failed:', e));
 }
 
 // DeOS Compiler Guide p.78 — the trade-off each Lagrangian point names.
@@ -1590,7 +1605,7 @@ document.getElementById('speed-slider').oninput = e => {
 };
 
 resizeCanvas();
-connect();
+pollStatus();
 requestAnimationFrame(animatePulses);
 </script>
 
